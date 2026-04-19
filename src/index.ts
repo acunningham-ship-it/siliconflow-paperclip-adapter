@@ -31,6 +31,9 @@ import {
   DEFAULT_PROMPT_TEMPLATE,
   DEFAULT_TIMEOUT_SEC,
   FREE_MODELS,
+  KNOWN_NO_TOOLS_MODELS,
+  NON_CHAT_ID_FRAGMENTS,
+  PAID_MODELS,
   SILICONFLOW_BASE_URL,
 } from "./shared/constants.js";
 import {
@@ -44,16 +47,109 @@ export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
 
 /**
- * Static fallback for the model list. Populated from FREE_MODELS so the UI
- * has something to show when the /v1/models fetch at boot fails (e.g.
- * trans-Pacific connectivity issue).
+ * Extended model shape. `AdapterModel` in the SDK is currently `{id,label}`
+ * only; we attach extra metadata (free, contextWindow, supportsTools) as
+ * loosely-typed optional fields so downstream consumers (UI / model-pickers
+ * / cost estimators) can read them when present. TypeScript structural
+ * typing keeps this compatible with the SDK contract.
  */
-const STATIC_FALLBACK: AdapterModel[] = FREE_MODELS.map((id) => ({
-  id,
-  label: `${id} — free`,
-}));
+type EnrichedAdapterModel = AdapterModel & {
+  free?: boolean;
+  contextWindow?: number;
+  supportsTools?: boolean;
+};
 
-async function loadModels(): Promise<AdapterModel[]> {
+const FREE_SET = new Set<string>(FREE_MODELS);
+const KNOWN_NO_TOOLS_SET = new Set<string>(KNOWN_NO_TOOLS_MODELS);
+
+/** Filter: skip embedding / reranker / audio / image models. */
+function isChatCapable(id: string): boolean {
+  const lower = id.toLowerCase();
+  for (const frag of NON_CHAT_ID_FRAGMENTS) {
+    if (lower.includes(frag)) return false;
+  }
+  return true;
+}
+
+/**
+ * Tool-calling support heuristic. Prefers the live `supports_tools` field
+ * when SiliconFlow exposes it; otherwise falls back to a denylist.
+ */
+function inferSupportsTools(id: string, live: unknown): boolean {
+  if (typeof live === "boolean") return live;
+  if (KNOWN_NO_TOOLS_SET.has(id)) return false;
+  // Default assumption: modern SiliconFlow chat models speak OpenAI tools.
+  return true;
+}
+
+/** Rough capability rank for sort-order tie breaking (higher = better). */
+function capabilityRank(id: string): number {
+  const lower = id.toLowerCase();
+  // Heuristic: bigger / newer families first.
+  if (lower.includes("deepseek-v3")) return 95;
+  if (lower.includes("deepseek-r1")) return 94;
+  if (lower.includes("qwen3-235b")) return 90;
+  if (lower.includes("kimi-k2")) return 88;
+  if (lower.includes("qwen3-32b")) return 80;
+  if (lower.includes("glm-5")) return 75;
+  if (lower.includes("qwen3")) return 70;
+  return 50;
+}
+
+function buildLabel(id: string, free: boolean, supportsTools: boolean): string {
+  const tags: string[] = [];
+  if (free) tags.push("free");
+  if (!supportsTools) tags.push("no-tools");
+  return tags.length > 0 ? `${id} — ${tags.join(", ")}` : id;
+}
+
+/**
+ * Static fallback for the model list. Seeded with FREE_MODELS + known paid
+ * models so the UI always has something coherent when /v1/models is
+ * unreachable (e.g. a trans-Pacific connectivity blip).
+ */
+const STATIC_FALLBACK: EnrichedAdapterModel[] = [
+  ...FREE_MODELS.map((id) => ({
+    id,
+    free: true,
+    supportsTools: !KNOWN_NO_TOOLS_SET.has(id),
+    label: buildLabel(id, true, !KNOWN_NO_TOOLS_SET.has(id)),
+  })),
+  ...PAID_MODELS.map((id) => ({
+    id,
+    free: false,
+    supportsTools: true,
+    label: buildLabel(id, false, true),
+  })),
+];
+
+interface LiveModelRecord {
+  id?: string;
+  context_length?: unknown;
+  context_window?: unknown;
+  max_context_length?: unknown;
+  supports_tools?: unknown;
+  pricing?: unknown;
+}
+
+function asNumberOrUndef(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function inferFree(id: string, record: LiveModelRecord): boolean {
+  if (FREE_SET.has(id)) return true;
+  // Some providers indicate free via zero pricing; be permissive.
+  const pricing = record.pricing;
+  if (pricing && typeof pricing === "object") {
+    const p = pricing as Record<string, unknown>;
+    const inCost = asNumberOrUndef(p.input) ?? asNumberOrUndef(p.prompt);
+    const outCost = asNumberOrUndef(p.output) ?? asNumberOrUndef(p.completion);
+    if (inCost === 0 && outCost === 0) return true;
+  }
+  return false;
+}
+
+async function loadModels(): Promise<EnrichedAdapterModel[]> {
   try {
     const apiKey = (process.env[AUTH_ENV_VAR] ?? "").trim();
     const headers: Record<string, string> = { accept: "application/json" };
@@ -63,23 +159,39 @@ async function loadModels(): Promise<AdapterModel[]> {
       signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) return STATIC_FALLBACK;
-    const body = (await resp.json()) as { data?: Array<{ id?: string }> };
+    const body = (await resp.json()) as { data?: LiveModelRecord[] };
     if (!body || !Array.isArray(body.data)) return STATIC_FALLBACK;
-    const freeSet = new Set<string>(FREE_MODELS);
-    const out: AdapterModel[] = [];
+
+    const out: EnrichedAdapterModel[] = [];
     for (const m of body.data) {
       if (!m || typeof m.id !== "string" || !m.id) continue;
+      const id = m.id;
+      if (!isChatCapable(id)) continue;
+      const free = inferFree(id, m);
+      const supportsTools = inferSupportsTools(id, m.supports_tools);
+      const contextWindow =
+        asNumberOrUndef(m.context_length) ??
+        asNumberOrUndef(m.context_window) ??
+        asNumberOrUndef(m.max_context_length);
       out.push({
-        id: m.id,
-        label: freeSet.has(m.id) ? `${m.id} — free` : m.id,
+        id,
+        label: buildLabel(id, free, supportsTools),
+        free,
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+        supportsTools,
       });
     }
-    // Put free models first, keep the rest in server order.
+
+    // Sort: free first, then by capability rank desc, then alpha.
     out.sort((a, b) => {
-      const aFree = freeSet.has(a.id) ? 0 : 1;
-      const bFree = freeSet.has(b.id) ? 0 : 1;
-      return aFree - bFree;
+      const aFree = a.free ? 0 : 1;
+      const bFree = b.free ? 0 : 1;
+      if (aFree !== bFree) return aFree - bFree;
+      const rankDiff = capabilityRank(b.id) - capabilityRank(a.id);
+      if (rankDiff !== 0) return rankDiff;
+      return a.id.localeCompare(b.id);
     });
+
     return out.length > 0 ? out : STATIC_FALLBACK;
   } catch {
     return STATIC_FALLBACK;
@@ -119,14 +231,28 @@ The adapter reads \`${AUTH_ENV_VAR}\` in this order:
 
 ${FREE_MODELS.map((m) => `- \`${m}\``).join("\n")}
 
-## Limitations (v0.0.1)
+## Tool Calling (v0.7)
 
-- **Single-turn only.** Every run starts a fresh conversation.
-- **No tool calling.** TODO — the SiliconFlow API supports OpenAI-style
-  \`tools\` / \`tool_choice\`, but the adapter does not yet translate
-  Paperclip's tool protocol to them.
+The adapter now speaks OpenAI-style tool calling. Pass tool definitions in
+\`agentConfig.tools\` (array of \`{ type: "function", function: {...} }\`
+entries) or via \`context.paperclipTools\`. The adapter will:
+
+1. Forward them to SiliconFlow with \`tool_choice: "auto"\`.
+2. Stream the response, reassemble \`tool_calls\` deltas.
+3. On \`finish_reason: "tool_calls"\`, invoke each tool through
+   \`context.paperclipInvokeTool(name, args)\` if provided, otherwise record
+   the call + an error stub and continue.
+4. Loop until \`finish_reason: "stop"\` or ${DEFAULT_TIMEOUT_SEC}s elapse,
+   capped at 10 iterations.
+
+Models with \`supportsTools: false\` reject the call up front with a
+graceful error.
+
+## Limitations
+
 - **No per-call cost reporting.** SiliconFlow does not return cost in the
   chat/completions response; \`costUsd\` is always \`null\`.
+- **No session resume.** Each run starts fresh (SiliconFlow is stateless).
 `;
 
 const configSchema: AdapterConfigSchema = {

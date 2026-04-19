@@ -1,7 +1,7 @@
 {
   "name": "siliconflow-paperclip-adapter",
-  "version": "0.0.1",
-  "description": "Paperclip adapter for SiliconFlow's free pool (DeepSeek V3, Qwen 3, Kimi K2.5, GLM 5).",
+  "version": "0.7.0",
+  "description": "Paperclip adapter for SiliconFlow (DeepSeek V3, Qwen 3, Kimi K2.5, GLM 5) — tool calling + full model catalog.",
   "type": "module",
   "license": "MIT",
   "author": "Armani Cunningham",

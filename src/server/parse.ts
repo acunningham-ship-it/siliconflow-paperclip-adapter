@@ -17,6 +17,20 @@
 
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
+/**
+ * Reassembled tool call from streamed `tool_calls` deltas. OpenAI-compatible
+ * shape: `{ id, type: "function", function: { name, arguments } }` where
+ * `arguments` is a JSON string accumulated across delta chunks.
+ */
+export interface ParsedToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
 export interface ParsedSiliconFlowStream {
   /** Concatenated assistant text across all delta chunks. */
   text: string;
@@ -34,6 +48,8 @@ export interface ParsedSiliconFlowStream {
   lastChunkId: string | null;
   /** Error payload if the server sent `data: {"error": ...}` mid-stream. */
   error: string | null;
+  /** Reassembled tool calls, in index order. Empty if none. */
+  toolCalls: ParsedToolCall[];
 }
 
 function tryParseJson(line: string): unknown {
@@ -56,7 +72,18 @@ export function parseSiliconFlowStream(body: string): ParsedSiliconFlowStream {
     usage: null,
     lastChunkId: null,
     error: null,
+    toolCalls: [],
   };
+
+  /**
+   * Tool call accumulator keyed by `index` (OpenAI streams tool_calls as
+   * an array indexed by slot number; a single call may arrive across many
+   * delta chunks with name in one and argument fragments across many).
+   */
+  const toolAcc = new Map<
+    number,
+    { id: string; name: string; argParts: string[] }
+  >();
 
   const textParts: string[] = [];
   for (const rawLine of body.split(/\r?\n/)) {
@@ -92,6 +119,28 @@ export function parseSiliconFlowStream(body: string): ParsedSiliconFlowStream {
       if (delta && typeof delta.content === "string") {
         textParts.push(delta.content);
       }
+      // Streamed OpenAI-compatible tool_calls deltas. Shape per chunk:
+      //   { tool_calls: [{ index: 0, id?: "call_...", type?: "function",
+      //                    function?: { name?: "...", arguments?: "..." } }] }
+      if (delta && Array.isArray(delta.tool_calls)) {
+        for (const raw of delta.tool_calls) {
+          if (!raw || typeof raw !== "object") continue;
+          const tc = raw as Record<string, unknown>;
+          const idx = typeof tc.index === "number" ? tc.index : 0;
+          let slot = toolAcc.get(idx);
+          if (!slot) {
+            slot = { id: "", name: "", argParts: [] };
+            toolAcc.set(idx, slot);
+          }
+          if (typeof tc.id === "string" && tc.id) slot.id = tc.id;
+          const fn = tc.function;
+          if (fn && typeof fn === "object") {
+            const fnObj = fn as Record<string, unknown>;
+            if (typeof fnObj.name === "string" && fnObj.name) slot.name = fnObj.name;
+            if (typeof fnObj.arguments === "string") slot.argParts.push(fnObj.arguments);
+          }
+        }
+      }
       if (typeof choice.finish_reason === "string" && choice.finish_reason) {
         out.finishReason = choice.finish_reason;
       }
@@ -110,6 +159,25 @@ export function parseSiliconFlowStream(body: string): ParsedSiliconFlowStream {
   }
 
   out.text = textParts.join("");
+
+  // Materialize accumulated tool calls, preserving slot index order.
+  const indices = [...toolAcc.keys()].sort((a, b) => a - b);
+  for (const idx of indices) {
+    const slot = toolAcc.get(idx);
+    if (!slot) continue;
+    // Skip empty slots (server occasionally sends a probing index with no
+    // name/id — discarding keeps downstream invoke loops clean).
+    if (!slot.name && !slot.id) continue;
+    out.toolCalls.push({
+      id: slot.id || `call_${idx}`,
+      type: "function",
+      function: {
+        name: slot.name,
+        arguments: slot.argParts.join(""),
+      },
+    });
+  }
+
   return out;
 }
 
